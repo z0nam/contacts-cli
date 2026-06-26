@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""contacts — read macOS Contacts (연락처 / AddressBook), read-only.
+
+Subcommands:
+  contacts <query>                 이름·소속·번호·이메일 부분일치로 카드 목록
+  contacts search <query> [--json] (위와 동일; 명시형)
+  contacts show <query> [--json]   단일 인물 전체 카드(여러 매칭이면 후보 제시)
+  contacts lookup <handle> [--json] 역방향: 전화/이메일 → 이름
+  contacts list [--limit N] [--json] 전체 연락처 간략 목록
+
+Reads ~/Library/Application Support/AddressBook/**/AddressBook-v22.abcddb.
+각 DB는 mode=ro&immutable=1 URI로 직접 열며 원본은 절대 건드리지 않는다.
+AddressBook은 Full Disk Access 없이도 읽힌다(메시지 chat.db와 다름).
+여러 소스(iCloud/Google/local)를 합치고 중복은 병합한다.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime
+
+COCOA_EPOCH = 978307200  # 1970-01-01 ~ 2001-01-01 UTC 사이 초
+
+ADDRESSBOOK_DIR = os.path.expanduser("~/Library/Application Support/AddressBook")
+ADDRESSBOOK_GLOB = os.path.join(ADDRESSBOOK_DIR, "**", "AddressBook-v22.abcddb")
+ADDRESSBOOK_MAIN = os.path.join(ADDRESSBOOK_DIR, "AddressBook-v22.abcddb")
+
+# 한국어가 로케일과 무관하게 깨지지 않도록 stdout을 UTF-8로.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+
+def _die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------
+# 헬퍼 (messages-cli/msg 와 동일 규약: CJK 이름 조합, 숫자 추출)
+# --------------------------------------------------------------------------
+def _has_cjk(s):
+    return any(
+        "぀" <= ch <= "鿿"
+        or "가" <= ch <= "힣"
+        or "豈" <= ch <= "﫿"
+        for ch in s
+    )
+
+
+def digits(s):
+    return re.sub(r"\D", "", s or "")
+
+
+def compose_name(first, last, middle, nick, org):
+    """macOS가 보여주는 방식의 표시 이름(CJK = 성+이름)."""
+    first = (first or "").strip()
+    last = (last or "").strip()
+    middle = (middle or "").strip()
+    if first or last or middle:
+        if _has_cjk(first + last + middle):
+            # 한국어/한자/일본어: 성 + 이름 (중간이름은 이름 뒤에 붙임)
+            return ((last or "") + (first or "") + (middle or "")) or None
+        parts = [p for p in (first, middle, last) if p]
+        return " ".join(parts) or None
+    for alt in (nick, org):
+        if alt and alt.strip():
+            return alt.strip()
+    return None
+
+
+def clean_label(label):
+    """ZLABEL 정규화: '_$!<Mobile>!$_' → 'mobile'. 커스텀 라벨은 그대로(소문자)."""
+    if not label:
+        return None
+    m = re.match(r"_\$!<(.+?)>!\$_", label)
+    if m:
+        return m.group(1).lower()
+    s = label.strip()
+    return s.lower() if s else None
+
+
+def cocoa_to_date(value):
+    """Cocoa TIMESTAMP → 'YYYY-MM-DD'(시간 무시). 실패하면 None."""
+    if not value:
+        return None
+    try:
+        unix = float(value) + COCOA_EPOCH
+        return datetime.fromtimestamp(unix).strftime("%Y-%m-%d")
+    except (OverflowError, OSError, ValueError, TypeError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# AddressBook 로딩 (read-only, 멀티소스 병합)
+# --------------------------------------------------------------------------
+class Card:
+    """병합된 연락처 1건."""
+
+    __slots__ = ("name", "first", "last", "middle", "nickname", "org",
+                 "title", "department", "birthday", "phones", "emails",
+                 "phone8", "email_norm", "sources")
+
+    def __init__(self):
+        self.name = None
+        self.first = self.last = self.middle = ""
+        self.nickname = self.org = self.title = self.department = ""
+        self.birthday = None
+        self.phones = []        # [(label, number)]
+        self.emails = []        # [(label, address)]
+        self.phone8 = set()     # 매칭용 last-8 자릿수
+        self.email_norm = set()  # 매칭용 소문자 이메일
+        self.sources = set()    # 기여한 소스 id(짧은 UUID)
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "first": self.first or None,
+            "last": self.last or None,
+            "nickname": self.nickname or None,
+            "org": self.org or None,
+            "title": self.title or None,
+            "department": self.department or None,
+            "phones": [{"label": l, "number": n} for l, n in self.phones],
+            "emails": [{"label": l, "address": a} for l, a in self.emails],
+            "birthday": self.birthday,
+            "sources": sorted(self.sources),
+        }
+
+
+def _source_id(db_path):
+    """Sources/<UUID>/... 경로에서 짧은 식별자. 메인 DB는 'main'."""
+    parent = os.path.basename(os.path.dirname(db_path))
+    if parent == "AddressBook":
+        return "main"
+    return parent[:8]
+
+
+def _addressbook_dbs():
+    paths = [p for p in glob.glob(ADDRESSBOOK_GLOB, recursive=True)
+             if os.path.exists(p)]
+    if ADDRESSBOOK_MAIN not in paths and os.path.exists(ADDRESSBOOK_MAIN):
+        paths.append(ADDRESSBOOK_MAIN)
+    return paths
+
+
+def load_cards():
+    """모든 AddressBook DB를 읽어 병합된 Card 리스트를 돌려준다.
+
+    같은 이름끼리 묶은 뒤, 핸들(전화/이메일)을 하나라도 공유하면 한 사람으로
+    병합한다(union-find). 핸들이 겹치지 않는 동명이인은 따로 둔다.
+    AddressBook을 못 읽으면 빈 리스트(친절 저하).
+    """
+    raw = []  # 소스별 레코드(병합 전)
+    for db in _addressbook_dbs():
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+        except sqlite3.OperationalError:
+            continue
+        try:
+            raw.extend(_load_one(con, _source_id(db)))
+        except sqlite3.Error:
+            pass
+        finally:
+            con.close()
+    return _merge(raw)
+
+
+def _load_one(con, src):
+    recs = {}  # Z_PK -> Card
+    for pk, fn, ln, mn, nick, org, title, dept, bday in con.execute(
+        "SELECT Z_PK, ZFIRSTNAME, ZLASTNAME, ZMIDDLENAME, ZNICKNAME, "
+        "ZORGANIZATION, ZJOBTITLE, ZDEPARTMENT, ZBIRTHDAY FROM ZABCDRECORD"
+    ):
+        nm = compose_name(fn, ln, mn, nick, org)
+        if not nm:
+            continue
+        c = Card()
+        c.name = nm
+        c.first, c.last, c.middle = (fn or ""), (ln or ""), (mn or "")
+        c.nickname, c.org = (nick or ""), (org or "")
+        c.title, c.department = (title or ""), (dept or "")
+        c.birthday = cocoa_to_date(bday)
+        c.sources.add(src)
+        recs[pk] = c
+    for owner, label, num in con.execute(
+        "SELECT ZOWNER, ZLABEL, ZFULLNUMBER FROM ZABCDPHONENUMBER "
+        "WHERE ZFULLNUMBER IS NOT NULL"
+    ):
+        c = recs.get(owner)
+        if not c:
+            continue
+        d = digits(num)
+        c.phones.append((clean_label(label), num.strip()))
+        if d:
+            c.phone8.add(d[-8:])
+    for owner, label, addr in con.execute(
+        "SELECT ZOWNER, ZLABEL, ZADDRESS FROM ZABCDEMAILADDRESS "
+        "WHERE ZADDRESS IS NOT NULL"
+    ):
+        c = recs.get(owner)
+        if not c:
+            continue
+        e = addr.strip()
+        c.emails.append((clean_label(label), e))
+        c.email_norm.add(e.lower())
+    return list(recs.values())
+
+
+def _merge(raw):
+    """이름 그룹 안에서 핸들을 공유하는 레코드를 union-find로 병합."""
+    groups = {}
+    for c in raw:
+        groups.setdefault(c.name.strip().lower(), []).append(c)
+
+    merged = []
+    for items in groups.values():
+        parent = list(range(len(items)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i, j):
+            parent[find(i)] = find(j)
+
+        # 핸들(전화8/이메일) → 해당 레코드 인덱스로 연결
+        by_handle = {}
+        for idx, c in enumerate(items):
+            for h in (("p", p) for p in c.phone8):
+                by_handle.setdefault(h, idx)
+            for h in (("e", e) for e in c.email_norm):
+                by_handle.setdefault(h, idx)
+        seen_handle = {}
+        for idx, c in enumerate(items):
+            for h in [("p", p) for p in c.phone8] + [("e", e) for e in c.email_norm]:
+                if h in seen_handle:
+                    union(idx, seen_handle[h])
+                else:
+                    seen_handle[h] = idx
+
+        clusters = {}
+        for idx in range(len(items)):
+            clusters.setdefault(find(idx), []).append(items[idx])
+        for cluster in clusters.values():
+            merged.append(_combine(cluster))
+    merged.sort(key=lambda c: c.name)
+    return merged
+
+
+def _combine(cluster):
+    """같은 사람으로 판정된 레코드들을 하나의 Card로 합친다."""
+    base = cluster[0]
+    seen_ph, seen_em = set(), set()
+    phones, emails = [], []
+    for c in cluster:
+        # 스칼라 필드: 비어있으면 다른 소스 값으로 채움
+        for f in ("first", "last", "middle", "nickname", "org",
+                  "title", "department"):
+            if not getattr(base, f) and getattr(c, f):
+                setattr(base, f, getattr(c, f))
+        if not base.birthday and c.birthday:
+            base.birthday = c.birthday
+        for label, num in c.phones:
+            key = digits(num)[-8:] or num
+            if key not in seen_ph:
+                seen_ph.add(key)
+                phones.append((label, num))
+        for label, addr in c.emails:
+            key = addr.lower()
+            if key not in seen_em:
+                seen_em.add(key)
+                emails.append((label, addr))
+        base.phone8 |= c.phone8
+        base.email_norm |= c.email_norm
+        base.sources |= c.sources
+    base.phones, base.emails = phones, emails
+    return base
+
+
+# --------------------------------------------------------------------------
+# 검색 / 매칭
+# --------------------------------------------------------------------------
+def search_cards(cards, query):
+    """이름·별명·소속·직함·번호·이메일 부분일치(대소문자 무시)."""
+    q = query.strip().lower()
+    qd = digits(query)
+    out = []
+    for c in cards:
+        hay = " ".join(filter(None, [
+            c.name, c.nickname, c.org, c.title, c.department,
+            " ".join(a for _, a in c.emails),
+        ])).lower()
+        if q and q in hay:
+            out.append(c)
+            continue
+        if qd and len(qd) >= 4 and any(qd[-8:] in p or p in qd for p in c.phone8):
+            out.append(c)
+    return out
+
+
+def lookup_handle(cards, handle):
+    """전화/이메일 핸들 → 매칭 Card 리스트."""
+    out = []
+    if "@" in handle:
+        h = handle.strip().lower()
+        out = [c for c in cards if h in c.email_norm]
+    else:
+        d = digits(handle)
+        if d:
+            key = d[-8:]
+            out = [c for c in cards if key in c.phone8]
+    return out
+
+
+# --------------------------------------------------------------------------
+# 출력
+# --------------------------------------------------------------------------
+def _fmt_card(c, full=True):
+    lines = [c.name]
+    sub = " · ".join(filter(None, [c.title, c.department, c.org]))
+    if sub:
+        lines.append(f"  {sub}")
+    if c.nickname:
+        lines.append(f"  ({c.nickname})")
+    for label, num in c.phones:
+        lines.append(f"  📞 {num}" + (f"  [{label}]" if label else ""))
+    for label, addr in c.emails:
+        lines.append(f"  ✉️  {addr}" + (f"  [{label}]" if label else ""))
+    if full and c.birthday:
+        lines.append(f"  🎂 {c.birthday}")
+    return "\n".join(lines)
+
+
+def _fmt_brief(c):
+    bits = [c.name]
+    if c.org:
+        bits.append(f"({c.org})")
+    p = c.phones[0][1] if c.phones else (c.emails[0][1] if c.emails else "")
+    if p:
+        bits.append(f"— {p}")
+    return " ".join(bits)
+
+
+def _print_cards(cards, as_json, brief=False):
+    if as_json:
+        print(json.dumps([c.to_dict() for c in cards],
+                         ensure_ascii=False, indent=2))
+        return
+    if not cards:
+        print("(일치하는 연락처 없음)")
+        return
+    if brief:
+        for c in cards:
+            print(_fmt_brief(c))
+    else:
+        print(("\n\n").join(_fmt_card(c) for c in cards))
+
+
+# --------------------------------------------------------------------------
+# 명령
+# --------------------------------------------------------------------------
+def cmd_search(cards, args):
+    _print_cards(search_cards(cards, args.query), args.json)
+
+
+def cmd_show(cards, args):
+    hits = search_cards(cards, args.query)
+    if args.json:
+        _print_cards(hits, True)
+        return
+    if not hits:
+        print("(일치하는 연락처 없음)")
+    elif len(hits) == 1:
+        print(_fmt_card(hits[0]))
+    else:
+        print(f"{len(hits)}명 매칭 — 더 구체적으로 좁히세요:\n")
+        for c in hits:
+            print("  " + _fmt_brief(c))
+
+
+def cmd_lookup(cards, args):
+    _print_cards(lookup_handle(cards, args.handle), args.json, brief=not args.json)
+
+
+def cmd_list(cards, args):
+    if args.limit:
+        cards = cards[:args.limit]
+    _print_cards(cards, args.json, brief=not args.json)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="contacts", description="macOS 연락처(AddressBook) 조회 — 읽기 전용")
+    sub = p.add_subparsers(dest="cmd")
+
+    def add_json(sp):
+        sp.add_argument("--json", action="store_true", help="JSON 출력")
+
+    sp = sub.add_parser("search", help="이름·소속·번호·이메일로 검색")
+    sp.add_argument("query")
+    add_json(sp)
+
+    sp = sub.add_parser("show", help="단일 인물 전체 카드")
+    sp.add_argument("query")
+    add_json(sp)
+
+    sp = sub.add_parser("lookup", help="전화/이메일 → 이름 역조회")
+    sp.add_argument("handle")
+    add_json(sp)
+
+    sp = sub.add_parser("list", help="전체 연락처 간략 목록")
+    sp.add_argument("--limit", type=int, default=0)
+    add_json(sp)
+
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # 서브커맨드 없이 `contacts <query>` 도 search 로 처리
+    known = {"search", "show", "lookup", "list", "-h", "--help"}
+    if not raw:
+        p.print_help()
+        return
+    if raw[0] not in known:
+        q = " ".join(a for a in raw if a != "--json")
+        ns = argparse.Namespace(query=q, json=("--json" in raw))
+        cmd_search(load_cards(), ns)
+        return
+
+    args = p.parse_args(raw)
+    if args.cmd is None:
+        p.print_help()
+        return
+    cards = load_cards()
+    {"search": cmd_search, "show": cmd_show,
+     "lookup": cmd_lookup, "list": cmd_list}[args.cmd](cards, args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass

@@ -1,0 +1,10 @@
+# 절대 커밋 금지: 개인 연락처/주소록 데이터
+*.abcddb
+*.abcddb-*
+AddressBook/
+*.vcf
+
+# 잡동사니
+__pycache__/
+*.pyc
+.DS_Store
