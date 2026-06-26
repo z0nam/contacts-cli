@@ -9,8 +9,9 @@ macOS **연락처(Contacts / AddressBook)**를 읽는 읽기 전용 CLI. 이름�
 ## 설치
 ```sh
 ln -sf "$PWD/contacts" ~/.local/bin/contacts   # PATH에 ~/.local/bin 가정
-# Claude/Codex 스킬로도 쓰려면:
+# 단일 SKILL.md(SSOT)를 Claude·Codex 양쪽에 심링크:
 ln -sf "$PWD/.claude/skills/contacts" ~/.claude/skills/contacts
+ln -sf "$PWD/.claude/skills/contacts" ~/.codex/skills/contacts
 ```
 
 ## 사용
