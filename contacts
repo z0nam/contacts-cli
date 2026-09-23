@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime
 
@@ -158,9 +159,8 @@ def load_cards():
     """
     raw = []  # 소스별 레코드(병합 전)
     for db in _addressbook_dbs():
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
-        except sqlite3.OperationalError:
+        con = _connect_ro(db)
+        if con is None:
             continue
         try:
             raw.extend(_load_one(con, _source_id(db)))
@@ -169,6 +169,19 @@ def load_cards():
         finally:
             con.close()
     return _merge(raw)
+
+
+def _connect_ro(db):
+    """Read-only connection. Prefer mode=ro (sees the -wal sidecar, so a contact
+    just added via Contacts.app is visible immediately); fall back to immutable=1
+    which ignores the WAL but opens even a locked/odd DB. Both are read-only —
+    the file is never modified."""
+    for uri in (f"file:{db}?mode=ro", f"file:{db}?mode=ro&immutable=1"):
+        try:
+            return sqlite3.connect(uri, uri=True)
+        except sqlite3.Error:
+            continue
+    return None
 
 
 def _load_one(con, src):
@@ -365,6 +378,153 @@ def _print_cards(cards, as_json, brief=False):
 
 
 # --------------------------------------------------------------------------
+# 쓰기 (add) — 유일한 비-read-only 경로. abcddb는 절대 안 건드리고,
+# Contacts.app 을 osascript 로 구동해 카드를 만든다(공식 경로, iCloud 동기화 정상).
+# 이름/번호/이메일은 AppleScript 문자열 보간이 아니라 argv 로 넘겨 인젝션을 원천 차단한다
+# (messages-cli send 와 같은 패턴). 전화 개수·이메일 개수를 argv 안에 정수로 실어 파싱.
+# --------------------------------------------------------------------------
+_ADD_APPLESCRIPT = r'''on run argv
+  set theFirst to item 1 of argv
+  set theLast to item 2 of argv
+  set theOrg to item 3 of argv
+  set theTitle to item 4 of argv
+  set nPhones to (item 5 of argv) as integer
+  set i to 6
+  tell application "Contacts"
+    set p to make new person with properties {first name:theFirst, last name:theLast}
+    if theOrg is not "" then set organization of p to theOrg
+    if theTitle is not "" then set job title of p to theTitle
+    if theFirst is "" and theLast is "" and theOrg is not "" then set company of p to true
+    repeat nPhones times
+      make new phone at end of phones of p with properties {label:"mobile", value:(item i of argv)}
+      set i to i + 1
+    end repeat
+    set nEmails to (item i of argv) as integer
+    set i to i + 1
+    repeat nEmails times
+      make new email at end of emails of p with properties {label:"home", value:(item i of argv)}
+      set i to i + 1
+    end repeat
+    save
+    return id of p
+  end tell
+end run
+'''
+
+
+def add_via_contacts(first, last, org, title, phones, emails):
+    """Create a person in Contacts.app via osascript. Returns (ok, message).
+
+    All values ride in argv (no escaping pitfalls). Writes to the DEFAULT
+    account (usually iCloud). Requires Automation permission for Contacts.
+    """
+    argv = [first, last, org, title, str(len(phones)), *phones,
+            str(len(emails)), *emails]
+    try:
+        p = subprocess.run(
+            ["osascript", "-", *argv],
+            input=_ADD_APPLESCRIPT, text=True,
+            capture_output=True, timeout=30,
+        )
+    except FileNotFoundError:
+        return False, "osascript를 찾을 수 없습니다 (macOS 전용 기능입니다)."
+    except subprocess.TimeoutExpired:
+        return False, "시간 초과 — Automation 권한 팝업이 떠 있는지 확인하세요."
+    if p.returncode == 0:
+        return True, (p.stdout or "").strip()
+    err = (p.stderr or p.stdout or "").strip()
+    if "-1743" in err or "Not authorized" in err or "not allowed" in err:
+        return False, (
+            "Contacts 제어 권한이 없습니다 (Automation 필요).\n"
+            "System Settings > Privacy & Security > Automation 에서\n"
+            "이 명령을 실행하는 터미널 앱에 'Contacts' 제어를 허용한 뒤 다시 시도하세요.")
+    return False, f"연락처 생성 실패: {err}"
+
+
+def _resolve_name(args):
+    """(first, last) 결정. --first/--last 우선, 없으면 표시이름을 규칙대로 분해."""
+    if args.first is not None or args.last is not None:
+        return (args.first or "").strip(), (args.last or "").strip()
+    dn = (args.name or "").strip()
+    if not dn:
+        return "", ""
+    # CJK 또는 단일 토큰: 통째로 last 에(한국어 정렬·표시가 자연스러움).
+    # 서양식(공백 포함, 비CJK): 마지막 토큰만 last, 나머지 first.
+    if _has_cjk(dn) or " " not in dn:
+        return "", dn
+    head, _, tail = dn.rpartition(" ")
+    return head.strip(), tail.strip()
+
+
+def cmd_add(cards, args):
+    first, last = _resolve_name(args)
+    org = (args.org or "").strip()
+    title = (args.title or "").strip()
+    phones = [p.strip() for p in (args.phone or []) if p.strip()]
+    emails = [e.strip() for e in (args.email or []) if e.strip()]
+
+    if not (first or last or org):
+        _die("이름(표시이름 또는 --first/--last) 또는 --org 중 하나는 필요합니다.")
+
+    disp = compose_name(first, last, "", "", org) or (org or "(이름없음)")
+
+    # 미리보기
+    lines = [f"─ 생성 미리보기 ─", f"  이름   : {disp}"
+             + (f"   (first={first!r} last={last!r})" if (first or last) else "")]
+    if org:
+        lines.append(f"  소속   : {org}" + (f" / {title}" if title else ""))
+    elif title:
+        lines.append(f"  직함   : {title}")
+    for n in phones:
+        lines.append(f"  📞 {n}  [mobile]")
+    for e in emails:
+        lines.append(f"  ✉️  {e}  [home]")
+    lines.append("  대상   : 기본 계정(보통 iCloud) — 이후 동기화됨")
+    preview = "\n".join(lines)
+
+    # 중복 검색: 진짜 중복 신호만 — 전체 표시이름 + 각 핸들(전화/이메일).
+    # first/last/org 조각을 따로 검색하면 '우' 같은 1글자에 수백 건 오탐이 난다.
+    dupes = []
+    seen = set()
+    for q in filter(None, [disp, *phones, *emails]):
+        hits = lookup_handle(cards, q) if ("@" in q or digits(q)) else search_cards(cards, q)
+        for c in hits:
+            if id(c) not in seen:
+                seen.add(id(c))
+                dupes.append(c)
+
+    print(preview)
+    if dupes:
+        print(f"\n⚠️ 비슷한 기존 연락처 {len(dupes)}건:")
+        for c in dupes[:8]:
+            print("  " + _fmt_brief(c))
+
+    if args.dry_run:
+        print("\n(--dry-run: 실제로 생성하지 않았습니다)")
+        return
+
+    if dupes and not args.force:
+        _die("\n중복 가능성 때문에 중단했습니다. 그래도 만들려면 --force 를 붙이세요.")
+
+    if not args.force:
+        if not sys.stdin.isatty():
+            _die("\n확인이 필요합니다 (비대화형). 바로 만들려면 --force 를 붙이세요.")
+        try:
+            ans = input("\n위 내용으로 연락처를 만들까요? [y/N] : ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("취소했습니다.")
+            return
+
+    ok, msg = add_via_contacts(first, last, org, title, phones, emails)
+    if not ok:
+        _die(msg)
+    print(f"✓ 연락처 생성됨: {disp}")
+    print("  (로컬엔 바로 반영됨. 다른 기기로의 iCloud 동기화는 잠시 걸릴 수 있음)")
+
+
+# --------------------------------------------------------------------------
 # 명령
 # --------------------------------------------------------------------------
 def cmd_search(cards, args):
@@ -420,9 +580,20 @@ def main(argv=None):
     sp.add_argument("--limit", type=int, default=0)
     add_json(sp)
 
+    sp = sub.add_parser("add", help="연락처 생성(Contacts.app 경유, 미리보기+확인)")
+    sp.add_argument("name", nargs="?", help="표시이름(--first/--last 없을 때)")
+    sp.add_argument("--first", help="이름(first name)")
+    sp.add_argument("--last", help="성(last name)")
+    sp.add_argument("--org", help="소속/회사")
+    sp.add_argument("--title", help="직함")
+    sp.add_argument("--phone", action="append", help="전화(여러 번 가능)")
+    sp.add_argument("--email", action="append", help="이메일(여러 번 가능)")
+    sp.add_argument("--force", action="store_true", help="확인·중복경고 건너뛰고 생성")
+    sp.add_argument("--dry-run", action="store_true", help="미리보기만, 생성 안 함")
+
     raw = list(sys.argv[1:] if argv is None else argv)
     # 서브커맨드 없이 `contacts <query>` 도 search 로 처리
-    known = {"search", "show", "lookup", "list", "-h", "--help"}
+    known = {"search", "show", "lookup", "list", "add", "-h", "--help"}
     if not raw:
         p.print_help()
         return
@@ -437,8 +608,8 @@ def main(argv=None):
         p.print_help()
         return
     cards = load_cards()
-    {"search": cmd_search, "show": cmd_show,
-     "lookup": cmd_lookup, "list": cmd_list}[args.cmd](cards, args)
+    {"search": cmd_search, "show": cmd_show, "lookup": cmd_lookup,
+     "list": cmd_list, "add": cmd_add}[args.cmd](cards, args)
 
 
 if __name__ == "__main__":
